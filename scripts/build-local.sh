@@ -65,7 +65,7 @@ SRCDIR="${TMPDIR}/valkey-luau-${VERSION}"
 mkdir -p "$SRCDIR"
 rsync -a --exclude='.git' src/ "$SRCDIR/src/"
 rsync -a --exclude='.git' deps/ "$SRCDIR/deps/"
-cp CMakeLists.txt README.md LICENSE VERSION "$SRCDIR/"
+cp CMakeLists.txt valkeyluau.map README.md LICENSE VERSION "$SRCDIR/"
 tar czf "$SOURCE_DIR/valkey-luau-${VERSION}.tar.gz" -C "$TMPDIR" "valkey-luau-${VERSION}"
 
 # Determine platform parameters
