@@ -124,7 +124,7 @@ jobs:
             src/ "/tmp/${SRCDIR}/src/"
           rsync -a --exclude='.git' \
             deps/ "/tmp/${SRCDIR}/deps/"
-          cp CMakeLists.txt README.md LICENSE VERSION \
+          cp CMakeLists.txt valkeyluau.map README.md LICENSE VERSION \
             "/tmp/${SRCDIR}/"
           cd /tmp
           tar czf "${SRCDIR}.tar.gz" "${SRCDIR}"
