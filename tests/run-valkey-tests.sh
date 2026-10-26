@@ -26,9 +26,6 @@ echo "Module:  $LUAU_MODULE"
 echo ""
 
 EXTRA_SKIP_ARGS=(
-    "--skiptest" "Test loadfile are not available"
-    "--skiptest" "Test dofile are not available"
-    "--skiptest" "Test print are not available"
     "--skiptest" "/Test scripting debug"
     "--skiptest" "/Dynamic reset of lua engine with insecure API config change"
     "--skiptest" "Try trick readonly table on valkey table"
