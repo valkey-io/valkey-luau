@@ -435,19 +435,19 @@ void luauExtractErrorInformation(lua_State *lua, errorInfo *err_info) {
         return;
     }
 
-    lua_getfield(lua, -1, "err");
+    lua_rawgetfield(lua, -1, "err");
     if (lua_isstring(lua, -1)) err_info->msg = lm_strcpy(lua_tostring(lua, -1));
     lua_pop(lua, 1);
 
-    lua_getfield(lua, -1, "source");
+    lua_rawgetfield(lua, -1, "source");
     if (lua_isstring(lua, -1)) err_info->source = lm_strcpy(lua_tostring(lua, -1));
     lua_pop(lua, 1);
 
-    lua_getfield(lua, -1, "line");
+    lua_rawgetfield(lua, -1, "line");
     if (lua_isstring(lua, -1)) err_info->line = lm_strcpy(lua_tostring(lua, -1));
     lua_pop(lua, 1);
 
-    lua_getfield(lua, -1, "ignore_error_stats_update");
+    lua_rawgetfield(lua, -1, "ignore_error_stats_update");
     if (lua_isboolean(lua, -1))
         err_info->ignore_err_stats_update = lua_toboolean(lua, -1);
     lua_pop(lua, 1);
@@ -455,139 +455,182 @@ void luauExtractErrorInformation(lua_State *lua, errorInfo *err_info) {
     if (err_info->msg == NULL) err_info->msg = lm_strcpy("ERR unknown error");
 }
 
-void callReplyToLuaType(lua_State *lua, ValkeyModuleCallReply *reply, int resp) {
+#define LUAU_REPLY_OK 0
+#define LUAU_REPLY_TOO_DEEP 1
+#define LUAU_REPLY_TOO_BIG 2
+#define LUAU_REPLY_BAD_PROTO 3
+
+#define LUAU_MAX_TABLE_SIZE ((size_t)1 << 26)
+#define LUAU_MAX_STRING_SIZE ((size_t)1 << 30)
+
+static void luauProcessReplyError(const char *err, int err_no, lua_State *lua);
+
+static int luauReplyFailed(lua_State *lua, int base_top, int failed) {
+    lua_settop(lua, base_top);
+    switch (failed) {
+    case LUAU_REPLY_BAD_PROTO:
+        lua_pushnil(lua);
+        return 0;
+    case LUAU_REPLY_TOO_BIG:
+        luauPushError(lua, "reply too large to convert to a Lua value");
+        return 1;
+    default:
+        luauPushError(lua, "reached lua stack limit");
+        return 1;
+    }
+}
+
+static int callReplyIsStatus(ValkeyModuleCallReply *reply) {
+    size_t len = 0, attr_len = 0;
+    const char *proto = ValkeyModule_CallReplyProto(reply, &len);
+    ValkeyModuleCallReply *attr = ValkeyModule_CallReplyAttribute(reply);
+    if (attr) ValkeyModule_CallReplyProto(attr, &attr_len);
+    return proto && attr_len < len && proto[attr_len] == '+';
+}
+
+static int callReplyToLuaType(lua_State *lua, ValkeyModuleCallReply *reply, int resp, int depth) {
+    if (!lua_checkstack(lua, 6)) return LUAU_REPLY_TOO_DEEP;
+
     int type = ValkeyModule_CallReplyType(reply);
+    if (type == VALKEYMODULE_REPLY_STRING && callReplyIsStatus(reply))
+        type = VALKEYMODULE_REPLY_SIMPLE_STRING;
+    if ((type == VALKEYMODULE_REPLY_ARRAY || type == VALKEYMODULE_REPLY_MAP ||
+         type == VALKEYMODULE_REPLY_SET) &&
+        depth >= LUAU_MAX_REPLY_DEPTH)
+        return LUAU_REPLY_TOO_DEEP;
 
     switch (type) {
     case VALKEYMODULE_REPLY_STRING: {
-        lua_checkstack(lua, 1);
         size_t len = 0;
         const char *str = ValkeyModule_CallReplyStringPtr(reply, &len);
+        if (len > LUAU_MAX_STRING_SIZE) return LUAU_REPLY_TOO_BIG;
         lua_pushlstring(lua, str, len);
         break;
     }
     case VALKEYMODULE_REPLY_SIMPLE_STRING: {
-        lua_checkstack(lua, 3);
         size_t len = 0;
         const char *str = ValkeyModule_CallReplyStringPtr(reply, &len);
+        if (len > LUAU_MAX_STRING_SIZE) return LUAU_REPLY_TOO_BIG;
         lua_newtable(lua);
         lua_pushstring(lua, "ok");
         lua_pushlstring(lua, str, len);
-        lua_settable(lua, -3);
+        lua_rawset(lua, -3);
         break;
     }
     case VALKEYMODULE_REPLY_INTEGER: {
-        lua_checkstack(lua, 1);
         lua_pushnumber(lua, (lua_Number)ValkeyModule_CallReplyInteger(reply));
         break;
     }
     case VALKEYMODULE_REPLY_ARRAY: {
-        lua_checkstack(lua, 3);
         size_t items = ValkeyModule_CallReplyLength(reply);
+        if (items > LUAU_MAX_TABLE_SIZE) return LUAU_REPLY_TOO_BIG;
         lua_createtable(lua, (int)items, 0);
         for (size_t i = 0; i < items; i++) {
             ValkeyModuleCallReply *val = ValkeyModule_CallReplyArrayElement(reply, i);
-            lua_pushnumber(lua, (lua_Number)(i + 1));
-            callReplyToLuaType(lua, val, resp);
-            lua_settable(lua, -3);
+            int rc = callReplyToLuaType(lua, val, resp, depth + 1);
+            if (rc != LUAU_REPLY_OK) return rc;
+            lua_rawseti(lua, -2, (int)(i + 1));
         }
         break;
     }
     case VALKEYMODULE_REPLY_NULL:
     case VALKEYMODULE_REPLY_ARRAY_NULL:
-        lua_checkstack(lua, 1);
         if (resp == 2)
             lua_pushboolean(lua, 0);
         else
             lua_pushnil(lua);
         break;
     case VALKEYMODULE_REPLY_MAP: {
-        lua_checkstack(lua, 4);
         size_t items = ValkeyModule_CallReplyLength(reply);
+        if (items > LUAU_MAX_TABLE_SIZE) return LUAU_REPLY_TOO_BIG;
         lua_newtable(lua);
         lua_pushstring(lua, "map");
         lua_createtable(lua, 0, (int)items);
         for (size_t i = 0; i < items; i++) {
             ValkeyModuleCallReply *key = NULL, *val = NULL;
             ValkeyModule_CallReplyMapElement(reply, i, &key, &val);
-            callReplyToLuaType(lua, key, resp);
-            callReplyToLuaType(lua, val, resp);
-            lua_settable(lua, -3);
+            int rc = callReplyToLuaType(lua, key, resp, depth + 1);
+            if (rc == LUAU_REPLY_OK) rc = callReplyToLuaType(lua, val, resp, depth + 1);
+            if (rc != LUAU_REPLY_OK) return rc;
+            if (lua_isnil(lua, -2))
+                lua_pop(lua, 2);
+            else
+                lua_rawset(lua, -3);
         }
-        lua_settable(lua, -3);
+        lua_rawset(lua, -3);
         break;
     }
     case VALKEYMODULE_REPLY_SET: {
-        lua_checkstack(lua, 4);
         size_t items = ValkeyModule_CallReplyLength(reply);
+        if (items > LUAU_MAX_TABLE_SIZE) return LUAU_REPLY_TOO_BIG;
         lua_newtable(lua);
         lua_pushstring(lua, "set");
         lua_createtable(lua, 0, (int)items);
         for (size_t i = 0; i < items; i++) {
             ValkeyModuleCallReply *val = ValkeyModule_CallReplySetElement(reply, i);
-            callReplyToLuaType(lua, val, resp);
+            int rc = callReplyToLuaType(lua, val, resp, depth + 1);
+            if (rc != LUAU_REPLY_OK) return rc;
+            if (lua_isnil(lua, -1)) {
+                lua_pop(lua, 1);
+                continue;
+            }
             lua_pushboolean(lua, 1);
-            lua_settable(lua, -3);
+            lua_rawset(lua, -3);
         }
-        lua_settable(lua, -3);
+        lua_rawset(lua, -3);
         break;
     }
     case VALKEYMODULE_REPLY_BOOL:
-        lua_checkstack(lua, 1);
         lua_pushboolean(lua, ValkeyModule_CallReplyBool(reply));
         break;
     case VALKEYMODULE_REPLY_DOUBLE: {
-        lua_checkstack(lua, 3);
         lua_newtable(lua);
         lua_pushstring(lua, "double");
         lua_pushnumber(lua, ValkeyModule_CallReplyDouble(reply));
-        lua_settable(lua, -3);
+        lua_rawset(lua, -3);
         break;
     }
     case VALKEYMODULE_REPLY_BIG_NUMBER: {
-        lua_checkstack(lua, 3);
         size_t len = 0;
         const char *str = ValkeyModule_CallReplyBigNumber(reply, &len);
+        if (len > LUAU_MAX_STRING_SIZE) return LUAU_REPLY_TOO_BIG;
         lua_newtable(lua);
         lua_pushstring(lua, "big_number");
         lua_pushlstring(lua, str, len);
-        lua_settable(lua, -3);
+        lua_rawset(lua, -3);
         break;
     }
     case VALKEYMODULE_REPLY_VERBATIM_STRING: {
-        lua_checkstack(lua, 5);
         size_t len = 0;
         const char *format = NULL;
         const char *str = ValkeyModule_CallReplyVerbatim(reply, &len, &format);
+        if (len > LUAU_MAX_STRING_SIZE) return LUAU_REPLY_TOO_BIG;
         lua_newtable(lua);
         lua_pushstring(lua, "verbatim_string");
         lua_newtable(lua);
         lua_pushstring(lua, "string");
         lua_pushlstring(lua, str, len);
-        lua_settable(lua, -3);
+        lua_rawset(lua, -3);
         lua_pushstring(lua, "format");
         lua_pushlstring(lua, format, 3);
-        lua_settable(lua, -3);
-        lua_settable(lua, -3);
+        lua_rawset(lua, -3);
+        lua_rawset(lua, -3);
         break;
     }
     case VALKEYMODULE_REPLY_ERROR: {
-        lua_checkstack(lua, 3);
-        const char *err = ValkeyModule_CallReplyStringPtr(reply, NULL);
-        char *err_with_dash = lm_asprintf("-%s", err);
-        luauPushErrorBuff(lua, err_with_dash);
-        ValkeyModule_Free(err_with_dash);
-        lua_pushstring(lua, "ignore_error_stats_update");
-        lua_pushboolean(lua, 1);
-        lua_settable(lua, -3);
+        size_t len = 0;
+        const char *str = ValkeyModule_CallReplyStringPtr(reply, &len);
+        if (len > LUAU_MAX_STRING_SIZE) return LUAU_REPLY_TOO_BIG;
+        char *err = lm_strncpy(str, len);
+        luauProcessReplyError(err, 0, lua);
+        ValkeyModule_Free(err);
         break;
     }
-    case VALKEYMODULE_REPLY_ATTRIBUTE:
-        break;
     default:
         lua_pushnil(lua);
         break;
     }
+    return LUAU_REPLY_OK;
 }
 
 static void strmapchars(char *s, const char *from, const char *to, size_t setlen) {
@@ -699,7 +742,7 @@ static void luauReplyToServerReplyDepth(ValkeyModuleCtx *ctx, int resp_version, 
                     const char *s = lua_tolstring(lua, -1, &len);
                     ValkeyModule_ReplyWithVerbatimStringType(ctx, s, len, format);
                     ValkeyModule_Free(format);
-                    lua_pop(lua, 3);
+                    lua_pop(lua, 2);
                     break;
                 }
                 ValkeyModule_Free(format);
@@ -723,7 +766,7 @@ static void luauReplyToServerReplyDepth(ValkeyModuleCtx *ctx, int resp_version, 
                 len++;
             }
             ValkeyModule_ReplySetMapLength(ctx, len);
-            lua_pop(lua, 2);
+            lua_pop(lua, 1);
             break;
         }
         lua_pop(lua, 1);
@@ -741,7 +784,7 @@ static void luauReplyToServerReplyDepth(ValkeyModuleCtx *ctx, int resp_version, 
                 len++;
             }
             ValkeyModule_ReplySetSetLength(ctx, len);
-            lua_pop(lua, 2);
+            lua_pop(lua, 1);
             break;
         }
         lua_pop(lua, 1);
@@ -774,12 +817,127 @@ void luauReplyToServerReply(ValkeyModuleCtx *ctx, int resp_version, lua_State *l
     luauReplyToServerReplyDepth(ctx, resp_version, lua, 0);
 }
 
-static void freeServerArgv(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
-    for (int i = 0; i < argc; i++) ValkeyModule_FreeString(ctx, argv[i]);
-    ValkeyModule_Free(argv);
+static ValkeyModuleString *luauArgvCacheGet(luauEngineCtx *ectx,
+                                            int j,
+                                            const char *s,
+                                            size_t len) {
+    ValkeyModuleString *cached = ectx->argv_cache[j];
+    if (cached) {
+        size_t cached_len = 0;
+        const char *cached_s = ValkeyModule_StringPtrLen(cached, &cached_len);
+        if (cached_len != len || memcmp(cached_s, s, len) != 0) {
+            ValkeyModule_FreeString(NULL, cached);
+            cached = NULL;
+        }
+    }
+    if (!cached) {
+        cached = ValkeyModule_CreateString(NULL, s, len);
+        ectx->argv_cache[j] = cached;
+    }
+    ValkeyModule_RetainString(NULL, cached);
+    return cached;
 }
 
-static ValkeyModuleString **luauArgsToServerArgv(ValkeyModuleCtx *ctx,
+static int luauArgvCacheAllowed(luauEngineCtx *ectx, lua_State *lua) {
+    if (!ectx->core_commands || lua_type(lua, 1) != LUA_TSTRING) return 0;
+    size_t len = 0;
+    const char *name = lua_tolstring(lua, 1, &len);
+    if (len == 0 || len > LUAU_ARGV_CACHE_MAX_LEN) return 0;
+
+    if (ectx->argv_cache[0]) {
+        size_t cached_len = 0;
+        const char *cached = ValkeyModule_StringPtrLen(ectx->argv_cache[0], &cached_len);
+        if (cached_len == len && memcmp(cached, name, len) == 0) return 1;
+    }
+
+    char lower[LUAU_ARGV_CACHE_MAX_LEN];
+    for (size_t i = 0; i < len; i++) lower[i] = (char)tolower((unsigned char)name[i]);
+    int nokey = 1;
+    ValkeyModule_DictGetC(ectx->core_commands, lower, len, &nokey);
+    return !nokey;
+}
+
+static int luauCommandListApply(ValkeyModuleDict *names, ValkeyModuleCallReply *reply, int add) {
+    if (!reply || ValkeyModule_CallReplyType(reply) != VALKEYMODULE_REPLY_ARRAY) return 0;
+    size_t n = ValkeyModule_CallReplyLength(reply);
+    for (size_t i = 0; i < n; i++) {
+        size_t len = 0;
+        const char *name =
+            ValkeyModule_CallReplyStringPtr(ValkeyModule_CallReplyArrayElement(reply, i), &len);
+        if (!name || len == 0 || len > LUAU_ARGV_CACHE_MAX_LEN || memchr(name, '|', len)) continue;
+        char lower[LUAU_ARGV_CACHE_MAX_LEN];
+        for (size_t k = 0; k < len; k++) lower[k] = (char)tolower((unsigned char)name[k]);
+        if (add)
+            ValkeyModule_DictSetC(names, lower, len, (void *)1);
+        else
+            ValkeyModule_DictDelC(names, lower, len, NULL);
+    }
+    return 1;
+}
+
+ValkeyModuleDict *luauCoreCommandsCreate(ValkeyModuleCtx *ctx) {
+    ValkeyModuleDict *core = ValkeyModule_CreateDict(NULL);
+    ValkeyModuleCallReply *all = ValkeyModule_Call(ctx, "COMMAND", "c", "LIST");
+    int ok = luauCommandListApply(core, all, 1);
+    if (all) ValkeyModule_FreeCallReply(all);
+
+    ValkeyModuleCallReply *mods = ok ? ValkeyModule_Call(ctx, "MODULE", "c", "LIST") : NULL;
+    ok = mods && ValkeyModule_CallReplyType(mods) == VALKEYMODULE_REPLY_ARRAY;
+    size_t nmods = ok ? ValkeyModule_CallReplyLength(mods) : 0;
+    for (size_t i = 0; ok && i < nmods; i++) {
+        ValkeyModuleCallReply *info = ValkeyModule_CallReplyArrayElement(mods, i);
+        size_t nfields = ValkeyModule_CallReplyLength(info);
+        const char *name = NULL;
+        size_t name_len = 0;
+        for (size_t j = 0; j + 1 < nfields && !name; j += 2) {
+            size_t key_len = 0;
+            const char *key =
+                ValkeyModule_CallReplyStringPtr(ValkeyModule_CallReplyArrayElement(info, j), &key_len);
+            if (key && key_len == 4 && memcmp(key, "name", 4) == 0)
+                name = ValkeyModule_CallReplyStringPtr(ValkeyModule_CallReplyArrayElement(info, j + 1),
+                                                       &name_len);
+        }
+        if (!name) {
+            ok = 0;
+            break;
+        }
+        ValkeyModuleCallReply *cmds =
+            ValkeyModule_Call(ctx, "COMMAND", "cccb", "LIST", "FILTERBY", "MODULE", name, name_len);
+        ok = luauCommandListApply(core, cmds, 0);
+        if (cmds) ValkeyModule_FreeCallReply(cmds);
+    }
+    if (mods) ValkeyModule_FreeCallReply(mods);
+
+    if (!ok) {
+        ValkeyModule_FreeDict(NULL, core);
+        return NULL;
+    }
+    return core;
+}
+
+void luauArgvCacheFree(luauEngineCtx *ectx) {
+    for (int j = 0; j < LUAU_ARGV_CACHE_SIZE; j++) {
+        if (ectx->argv_cache[j]) ValkeyModule_FreeString(NULL, ectx->argv_cache[j]);
+        ectx->argv_cache[j] = NULL;
+    }
+    if (ectx->core_commands) ValkeyModule_FreeDict(NULL, ectx->core_commands);
+    ectx->core_commands = NULL;
+}
+
+static void freeServerArgv(luauEngineCtx *ectx,
+                           ValkeyModuleCtx *ctx,
+                           ValkeyModuleString **argv,
+                           int argc) {
+    for (int i = 0; i < argc; i++) ValkeyModule_FreeString(ctx, argv[i]);
+    if (argv == ectx->argv_buf) {
+        ectx->argv_cache_busy = 0;
+    } else {
+        ValkeyModule_Free(argv);
+    }
+}
+
+static ValkeyModuleString **luauArgsToServerArgv(luauEngineCtx *ectx,
+                                                 ValkeyModuleCtx *ctx,
                                                  lua_State *lua,
                                                  int *out_argc) {
     int argc = lua_gettop(lua);
@@ -788,14 +946,23 @@ static ValkeyModuleString **luauArgsToServerArgv(ValkeyModuleCtx *ctx,
         return NULL;
     }
 
-    ValkeyModuleString **argv = ValkeyModule_Calloc(argc, sizeof(*argv));
+    int use_cache = !ectx->argv_cache_busy && argc <= LUAU_ARGV_CACHE_SIZE &&
+                    luauArgvCacheAllowed(ectx, lua);
+    ValkeyModuleString **argv;
+    if (use_cache) {
+        argv = ectx->argv_buf;
+        ectx->argv_cache_busy = 1;
+    } else {
+        argv = ValkeyModule_Calloc(argc, sizeof(*argv));
+    }
     int built = 0;
 
     for (int j = 0; j < argc; j++) {
         int idx = j + 1;
+        char dbuf[64];
+        const char *s;
+        size_t len = 0;
         if (lua_type(lua, idx) == LUA_TNUMBER) {
-            char dbuf[64];
-            size_t len;
             lua_Number num = lua_tonumber(lua, idx);
             long long ll;
             if (double2ll((double)num, &ll)) {
@@ -804,19 +971,24 @@ static ValkeyModuleString **luauArgsToServerArgv(ValkeyModuleCtx *ctx,
                 len = (size_t)fpconv_dtoa((double)num, dbuf);
                 dbuf[len] = '\0';
             }
-            argv[j] = ValkeyModule_CreateString(ctx, dbuf, len);
+            s = dbuf;
         } else if (lua_type(lua, idx) == LUA_TSTRING) {
-            size_t len = 0;
-            const char *s = lua_tolstring(lua, idx, &len);
-            argv[j] = ValkeyModule_CreateString(ctx, s, len);
+            s = lua_tolstring(lua, idx, &len);
         } else {
             break;
+        }
+        if (use_cache && len <= LUAU_ARGV_CACHE_MAX_LEN) {
+            argv[j] = luauArgvCacheGet(ectx, j, s, len);
+        } else {
+            argv[j] = ValkeyModule_CreateString(ctx, s, len);
         }
         built++;
     }
 
+    lua_pop(lua, argc);
+
     if (built != argc) {
-        freeServerArgv(ctx, argv, built);
+        freeServerArgv(ectx, ctx, argv, built);
         luauPushError(lua, "Command arguments must be strings or integers");
         return NULL;
     }
@@ -825,27 +997,26 @@ static ValkeyModuleString **luauArgsToServerArgv(ValkeyModuleCtx *ctx,
     return argv;
 }
 
-static void luauProcessReplyError(ValkeyModuleCallReply *reply, lua_State *lua) {
-    const char *err = ValkeyModule_CallReplyStringPtr(reply, NULL);
+static void luauProcessReplyError(const char *err, int err_no, lua_State *lua) {
     int push_error = 1;
 
-    if (errno == ESPIPE) {
+    if (err_no == ESPIPE) {
         if (strncmp(err, "ERR command ", strlen("ERR command ")) == 0) {
             luauPushError(lua, "This Valkey command is not allowed from script");
             push_error = 0;
         }
-    } else if (errno == EINVAL) {
+    } else if (err_no == EINVAL) {
         if (strncmp(err, "ERR wrong number of arguments for ",
                     strlen("ERR wrong number of arguments for ")) == 0) {
             luauPushError(lua, "Wrong number of args calling command from script");
             push_error = 0;
         }
-    } else if (errno == ENOENT) {
+    } else if (err_no == ENOENT) {
         if (strncmp(err, "ERR unknown command '", strlen("ERR unknown command '")) == 0) {
             luauPushError(lua, "Unknown command called from script");
             push_error = 0;
         }
-    } else if (errno == EACCES) {
+    } else if (err_no == EACCES) {
         if (strncmp(err, "NOPERM ", strlen("NOPERM ")) == 0) {
             char *msg = lm_asprintf("ACL failure in script: %s",
                                     err + strlen("NOPERM "));
@@ -866,25 +1037,261 @@ static void luauProcessReplyError(ValkeyModuleCallReply *reply, lua_State *lua) 
     lua_settable(lua, -3);
 }
 
-static int luauServerGenericCommand(lua_State *lua, int raise_error) {
-    luauCallCtx *rctx = luauGetCallCtx(lua);
-    if (!rctx) {
-        luauPushError(lua, "server.call is only available inside a script");
-        return luauError(lua);
+#define LUAU_REPLY_ARRAY 1
+#define LUAU_REPLY_MAP 2
+#define LUAU_REPLY_SET 3
+
+typedef struct luauReplyFrame {
+    int type;
+    size_t count;
+} luauReplyFrame;
+
+typedef struct luauReplyCtx {
+    lua_State *lua;
+    int resp;
+    int base_top;
+    int depth;
+    int attr_skip;
+    int top_error;
+    int failed;
+    luauReplyFrame frames[LUAU_MAX_REPLY_DEPTH];
+} luauReplyCtx;
+
+static int luauReplyBegin(luauReplyCtx *rc, int slots, size_t size, size_t max_size) {
+    if (rc->failed || rc->attr_skip) return 0;
+    if (size > max_size) {
+        rc->failed = LUAU_REPLY_TOO_BIG;
+        return 0;
     }
+    if (!lua_checkstack(rc->lua, slots + 1)) {
+        rc->failed = LUAU_REPLY_TOO_DEEP;
+        return 0;
+    }
+    return 1;
+}
 
-    int argc = 0;
-    ValkeyModuleString **argv = luauArgsToServerArgv(rctx->module_ctx, lua, &argc);
-    if (argv == NULL) return raise_error ? luauError(lua) : 1;
+static int luauReplyBeginString(luauReplyCtx *rc, int slots, size_t len) {
+    return luauReplyBegin(rc, slots, len, LUAU_MAX_STRING_SIZE);
+}
 
-    char fmt[13] = "v!EMSX";
+static int luauReplyBeginScalar(luauReplyCtx *rc, int slots) {
+    return luauReplyBegin(rc, slots, 0, 0);
+}
+
+static void luauReplyEmit(luauReplyCtx *rc) {
+    if (rc->depth == 0) return;
+    lua_State *lua = rc->lua;
+    luauReplyFrame *f = &rc->frames[rc->depth - 1];
+    f->count++;
+
+    switch (f->type) {
+    case LUAU_REPLY_ARRAY:
+        lua_rawseti(lua, -2, (int)f->count);
+        break;
+    case LUAU_REPLY_MAP:
+        if (f->count % 2) break;
+        if (lua_isnil(lua, -2))
+            lua_pop(lua, 2);
+        else
+            lua_rawset(lua, -3);
+        break;
+    case LUAU_REPLY_SET:
+        if (lua_isnil(lua, -1)) {
+            lua_pop(lua, 1);
+            break;
+        }
+        lua_pushboolean(lua, 1);
+        lua_rawset(lua, -3);
+        break;
+    }
+}
+
+static int luauReplyOpen(luauReplyCtx *rc, int type, size_t len) {
+    if (!luauReplyBegin(rc, 3, len, LUAU_MAX_TABLE_SIZE)) return 0;
+    if (rc->depth >= LUAU_MAX_REPLY_DEPTH) {
+        rc->failed = LUAU_REPLY_TOO_DEEP;
+        return 0;
+    }
+    rc->frames[rc->depth].type = type;
+    rc->frames[rc->depth].count = 0;
+    rc->depth++;
+    return 1;
+}
+
+static void luauReplyNull(void *ctx) {
+    luauReplyCtx *rc = ctx;
+    if (!luauReplyBeginScalar(rc, 1)) return;
+    if (rc->resp == 2)
+        lua_pushboolean(rc->lua, 0);
+    else
+        lua_pushnil(rc->lua);
+    luauReplyEmit(rc);
+}
+
+static void luauReplyBulkString(void *ctx, const char *str, size_t len) {
+    luauReplyCtx *rc = ctx;
+    if (!luauReplyBeginString(rc, 1, len)) return;
+    lua_pushlstring(rc->lua, str, len);
+    luauReplyEmit(rc);
+}
+
+static void luauReplySimpleString(void *ctx, const char *str, size_t len) {
+    luauReplyCtx *rc = ctx;
+    if (!luauReplyBeginString(rc, 3, len)) return;
+    lua_newtable(rc->lua);
+    lua_pushstring(rc->lua, "ok");
+    lua_pushlstring(rc->lua, str, len);
+    lua_rawset(rc->lua, -3);
+    luauReplyEmit(rc);
+}
+
+static void luauReplyVerbatimString(void *ctx, const char *str, size_t len, const char *fmt) {
+    luauReplyCtx *rc = ctx;
+    lua_State *lua = rc->lua;
+    if (!luauReplyBeginString(rc, 5, len)) return;
+    lua_newtable(lua);
+    lua_pushstring(lua, "verbatim_string");
+    lua_newtable(lua);
+    lua_pushstring(lua, "string");
+    lua_pushlstring(lua, str, len);
+    lua_rawset(lua, -3);
+    lua_pushstring(lua, "format");
+    lua_pushlstring(lua, fmt, 3);
+    lua_rawset(lua, -3);
+    lua_rawset(lua, -3);
+    luauReplyEmit(rc);
+}
+
+static void luauReplyError(void *ctx, const char *msg, size_t len) {
+    luauReplyCtx *rc = ctx;
+    int err_no = errno;
+    if (!luauReplyBeginString(rc, 5, len)) return;
+
+    char *err = lm_strncpy(msg, len);
+    luauProcessReplyError(err, rc->depth == 0 ? err_no : 0, rc->lua);
+    ValkeyModule_Free(err);
+
+    if (rc->depth == 0) rc->top_error = 1;
+    luauReplyEmit(rc);
+}
+
+static void luauReplyInteger(void *ctx, long long val) {
+    luauReplyCtx *rc = ctx;
+    if (!luauReplyBeginScalar(rc, 1)) return;
+    lua_pushnumber(rc->lua, (lua_Number)val);
+    luauReplyEmit(rc);
+}
+
+static void luauReplyDouble(void *ctx, double val) {
+    luauReplyCtx *rc = ctx;
+    if (!luauReplyBeginScalar(rc, 3)) return;
+    lua_newtable(rc->lua);
+    lua_pushstring(rc->lua, "double");
+    lua_pushnumber(rc->lua, val);
+    lua_rawset(rc->lua, -3);
+    luauReplyEmit(rc);
+}
+
+static void luauReplyBigNumber(void *ctx, const char *str, size_t len) {
+    luauReplyCtx *rc = ctx;
+    if (!luauReplyBeginString(rc, 3, len)) return;
+    lua_newtable(rc->lua);
+    lua_pushstring(rc->lua, "big_number");
+    lua_pushlstring(rc->lua, str, len);
+    lua_rawset(rc->lua, -3);
+    luauReplyEmit(rc);
+}
+
+static void luauReplyBool(void *ctx, int val) {
+    luauReplyCtx *rc = ctx;
+    if (!luauReplyBeginScalar(rc, 1)) return;
+    lua_pushboolean(rc->lua, val);
+    luauReplyEmit(rc);
+}
+
+static void luauReplyAttributeStart(void *ctx, size_t len) {
+    VALKEYMODULE_NOT_USED(len);
+    ((luauReplyCtx *)ctx)->attr_skip++;
+}
+
+static void luauReplyAttributeEnd(void *ctx) {
+    ((luauReplyCtx *)ctx)->attr_skip--;
+}
+
+static void luauReplyArrayStart(void *ctx, size_t len) {
+    luauReplyCtx *rc = ctx;
+    if (!luauReplyOpen(rc, LUAU_REPLY_ARRAY, len)) return;
+    lua_createtable(rc->lua, (int)len, 0);
+}
+
+static void luauReplyArrayEnd(void *ctx) {
+    luauReplyCtx *rc = ctx;
+    if (rc->failed || rc->attr_skip) return;
+    rc->depth--;
+    luauReplyEmit(rc);
+}
+
+static void luauReplyKeyedStart(luauReplyCtx *rc, int type, const char *field, size_t len) {
+    if (!luauReplyOpen(rc, type, len)) return;
+    lua_newtable(rc->lua);
+    lua_pushstring(rc->lua, field);
+    lua_createtable(rc->lua, 0, (int)len);
+}
+
+static void luauReplyMapStart(void *ctx, size_t len) {
+    luauReplyKeyedStart(ctx, LUAU_REPLY_MAP, "map", len);
+}
+
+static void luauReplySetStart(void *ctx, size_t len) {
+    luauReplyKeyedStart(ctx, LUAU_REPLY_SET, "set", len);
+}
+
+static void luauReplyKeyedEnd(void *ctx) {
+    luauReplyCtx *rc = ctx;
+    if (rc->failed || rc->attr_skip) return;
+    lua_rawset(rc->lua, -3);
+    rc->depth--;
+    luauReplyEmit(rc);
+}
+
+static void luauReplyParsingError(void *ctx) {
+    luauReplyCtx *rc = ctx;
+    if (!rc->failed) rc->failed = LUAU_REPLY_BAD_PROTO;
+}
+
+static const ValkeyModuleReplyHandlers luauReplyHandlers = {
+    .version = 1,
+    .null = luauReplyNull,
+    .nullBulkString = luauReplyNull,
+    .nullArray = luauReplyNull,
+    .bulkString = luauReplyBulkString,
+    .simpleString = luauReplySimpleString,
+    .verbatimString = luauReplyVerbatimString,
+    .error = luauReplyError,
+    .integer = luauReplyInteger,
+    .doubleVal = luauReplyDouble,
+    .bigNumber = luauReplyBigNumber,
+    .boolVal = luauReplyBool,
+    .attributeStart = luauReplyAttributeStart,
+    .attributeEnd = luauReplyAttributeEnd,
+    .arrayStart = luauReplyArrayStart,
+    .arrayEnd = luauReplyArrayEnd,
+    .mapStart = luauReplyMapStart,
+    .mapEnd = luauReplyKeyedEnd,
+    .setStart = luauReplySetStart,
+    .setEnd = luauReplyKeyedEnd,
+    .replyParsingError = luauReplyParsingError,
+};
+
+static int luau_callargv_rejected = 0;
+
+static int luauServerCallLegacy(luauCallCtx *rctx,
+                                lua_State *lua,
+                                ValkeyModuleString **argv,
+                                int argc) {
+    char fmt[12] = "v!EMSX";
     int fmt_idx = 6;
 
-    ValkeyModuleString *username = ValkeyModule_GetCurrentUserName(rctx->module_ctx);
-    if (username != NULL) {
-        fmt[fmt_idx++] = 'C';
-        ValkeyModule_FreeString(rctx->module_ctx, username);
-    }
     if (!(rctx->replication_flags & PROPAGATE_AOF)) fmt[fmt_idx++] = 'A';
     if (!(rctx->replication_flags & PROPAGATE_REPL)) fmt[fmt_idx++] = 'R';
     if (!rctx->replication_flags) {
@@ -894,29 +1301,102 @@ static int luauServerGenericCommand(lua_State *lua, int raise_error) {
     if (rctx->resp == 3) fmt[fmt_idx++] = '3';
     fmt[fmt_idx] = '\0';
 
-    const char *cmdname = ValkeyModule_StringPtrLen(argv[0], NULL);
+    size_t cmdlen = 0;
+    const char *cmdname = ValkeyModule_StringPtrLen(argv[0], &cmdlen);
+    if (memchr(cmdname, '\0', cmdlen)) {
+        freeServerArgv(rctx->engine_ctx, rctx->module_ctx, argv, argc);
+        luauPushError(lua, "Unknown command called from script");
+        return 1;
+    }
 
     errno = 0;
     ValkeyModuleCallReply *reply =
         ValkeyModule_Call(rctx->module_ctx, cmdname, fmt, argv + 1, argc - 1);
-    freeServerArgv(rctx->module_ctx, argv, argc);
+    int call_errno = errno;
+    freeServerArgv(rctx->engine_ctx, rctx->module_ctx, argv, argc);
 
     if (reply == NULL) {
         luauPushError(lua, "Unknown command called from script");
-        return raise_error ? luauError(lua) : 1;
+        return 1;
     }
 
-    int reply_type = ValkeyModule_CallReplyType(reply);
-    if (errno != 0) {
-        luauProcessReplyError(reply, lua);
+    int is_error = 1;
+    if (call_errno != 0) {
+        size_t len = 0;
+        const char *str = ValkeyModule_CallReplyStringPtr(reply, &len);
+        char *err = lm_strncpy(str ? str : "", str ? len : 0);
+        luauProcessReplyError(err, call_errno, lua);
+        ValkeyModule_Free(err);
     } else {
-        if (raise_error && reply_type != VALKEYMODULE_REPLY_ERROR) raise_error = 0;
-        callReplyToLuaType(lua, reply, rctx->resp);
+        int base_top = lua_gettop(lua);
+        is_error = ValkeyModule_CallReplyType(reply) == VALKEYMODULE_REPLY_ERROR;
+        int failed = callReplyToLuaType(lua, reply, rctx->resp, 0);
+        if (failed != LUAU_REPLY_OK) is_error = luauReplyFailed(lua, base_top, failed);
     }
 
     ValkeyModule_FreeCallReply(reply);
+    return is_error;
+}
 
-    if (raise_error) return luauError(lua);
+static int luauServerCallArgv(luauCallCtx *rctx,
+                              lua_State *lua,
+                              ValkeyModuleString **argv,
+                              int argc) {
+    int flags = VALKEYMODULE_CALL_ARGV_SCRIPT_MODE | VALKEYMODULE_CALL_ARGV_REPLICATE |
+                VALKEYMODULE_CALL_ARGV_ERRORS_AS_REPLIES |
+                VALKEYMODULE_CALL_ARGV_RESPECT_DENY_OOM | VALKEYMODULE_CALL_ARGV_REPLY_EXACT;
+
+    if (!(rctx->replication_flags & PROPAGATE_AOF)) flags |= VALKEYMODULE_CALL_ARGV_NO_AOF;
+    if (!(rctx->replication_flags & PROPAGATE_REPL)) flags |= VALKEYMODULE_CALL_ARGV_NO_REPLICAS;
+    if (rctx->resp == 3) flags |= VALKEYMODULE_CALL_ARGV_RESP_3;
+
+    luauReplyCtx rc;
+    rc.lua = lua;
+    rc.resp = rctx->resp;
+    rc.base_top = lua_gettop(lua);
+    rc.depth = 0;
+    rc.attr_skip = 0;
+    rc.top_error = 0;
+    rc.failed = LUAU_REPLY_OK;
+
+    int res = ValkeyModule_CallArgv(rctx->module_ctx, argv, argc, flags, &luauReplyHandlers, &rc);
+    if (res != VALKEYMODULE_OK) {
+        int err_no = errno;
+        lua_settop(lua, rc.base_top);
+        luau_callargv_rejected = 1;
+        ValkeyModule_Log(rctx->module_ctx, "warning",
+                         "ValkeyModule_CallArgv rejected server.call (%s); "
+                         "server.call uses ValkeyModule_Call from now on",
+                         strerror(err_no));
+        return luauServerCallLegacy(rctx, lua, argv, argc);
+    }
+    freeServerArgv(rctx->engine_ctx, rctx->module_ctx, argv, argc);
+
+    if (rc.failed != LUAU_REPLY_OK) return luauReplyFailed(lua, rc.base_top, rc.failed);
+    if (lua_gettop(lua) == rc.base_top) {
+        luauPushError(lua, "Unknown command called from script");
+        return 1;
+    }
+    return rc.top_error;
+}
+
+static int luauServerGenericCommand(lua_State *lua, int raise_error) {
+    luauCallCtx *rctx = luauGetCallCtx(lua);
+    if (!rctx) {
+        luauPushError(lua, "server.call is only available inside a script");
+        return luauError(lua);
+    }
+
+    int argc = 0;
+    ValkeyModuleString **argv =
+        luauArgsToServerArgv(rctx->engine_ctx, rctx->module_ctx, lua, &argc);
+    if (argv == NULL) return raise_error ? luauError(lua) : 1;
+
+    int is_error = ValkeyModule_CallArgv && !luau_callargv_rejected
+                       ? luauServerCallArgv(rctx, lua, argv, argc)
+                       : luauServerCallLegacy(rctx, lua, argv, argc);
+
+    if (raise_error && is_error) return luauError(lua);
     return 1;
 }
 
@@ -1064,7 +1544,8 @@ static int luauRedisAclCheckCmdPermissionsCommand(lua_State *lua) {
     }
 
     int argc = 0;
-    ValkeyModuleString **argv = luauArgsToServerArgv(rctx->module_ctx, lua, &argc);
+    ValkeyModuleString **argv =
+        luauArgsToServerArgv(rctx->engine_ctx, rctx->module_ctx, lua, &argc);
     if (argv == NULL) return luauError(lua);
 
     ValkeyModuleString *username = ValkeyModule_GetCurrentUserName(rctx->module_ctx);
@@ -1074,7 +1555,7 @@ static int luauRedisAclCheckCmdPermissionsCommand(lua_State *lua) {
     if (username) ValkeyModule_FreeString(rctx->module_ctx, username);
 
     if (user == NULL) {
-        freeServerArgv(rctx->module_ctx, argv, argc);
+        freeServerArgv(rctx->engine_ctx, rctx->module_ctx, argv, argc);
         luauPushError(lua, "Invalid command passed to server.acl_check_cmd()");
         return luauError(lua);
     }
@@ -1093,7 +1574,7 @@ static int luauRedisAclCheckCmdPermissionsCommand(lua_State *lua) {
     }
 
     ValkeyModule_FreeModuleUser(user);
-    freeServerArgv(rctx->module_ctx, argv, argc);
+    freeServerArgv(rctx->engine_ctx, rctx->module_ctx, argv, argc);
 
     if (raise_error) return luauError(lua);
     return 1;
@@ -1430,6 +1911,18 @@ size_t luauMemoryForCategory(lua_State *lua, int category) {
     return lua_totalbytes(lua, category);
 }
 
+int luauResume(luauCallCtx *call_ctx, lua_State *T, int nargs) {
+    int status = lua_resume(T, NULL, nargs);
+    while (status == LUA_YIELD && !call_ctx->killed) {
+        lua_settop(T, 0);
+        luaL_where(T, 1);
+        lua_pushstring(T, "attempt to yield across metamethod/C-call boundary");
+        lua_concat(T, 2);
+        status = lua_resumeerror(T, NULL);
+    }
+    return status;
+}
+
 void luauCallFunction(luauCallCtx *call_ctx, lua_State *T, int nargs) {
     ValkeyModuleCtx *ctx = call_ctx->module_ctx;
     luauEngineCtx *engine_ctx = call_ctx->engine_ctx;
@@ -1446,7 +1939,7 @@ void luauCallFunction(luauCallCtx *call_ctx, lua_State *T, int nargs) {
         lua_callbacks(engine_ctx->GL)->interrupt = luauInterrupt;
     }
 
-    int status = lua_resume(T, NULL, nargs);
+    int status = luauResume(call_ctx, T, nargs);
 
     if (watched) {
         lua_State *expected = engine_ctx->GL;
@@ -1478,8 +1971,12 @@ void luauCallFunction(luauCallCtx *call_ctx, lua_State *T, int nargs) {
     }
 
     if (status != LUA_OK) {
+        lua_State *GL = engine_ctx->GL;
         errorInfo err_info = {0};
-        luauExtractErrorInformation(T, &err_info);
+        lua_checkstack(GL, 2);
+        lua_xmove(T, GL, 1);
+        luauExtractErrorInformation(GL, &err_info);
+        lua_pop(GL, 1);
         if (err_info.line && err_info.source) {
             ValkeyModule_ReplyWithCustomErrorFormat(
                 ctx, !err_info.ignore_err_stats_update, "%s script: on %s:%s.",

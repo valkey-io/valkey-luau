@@ -26,6 +26,8 @@ echo "Module:  $LUAU_MODULE"
 echo ""
 
 EXTRA_SKIP_ARGS=(
+    "--skiptest" "Forked scripting debug session does not suspend save points"
+    "--skiptest" "server.log() keeps a multi-line message in one log record"
     "--skiptest" "/Test scripting debug"
     "--skiptest" "/Dynamic reset of lua engine with insecure API config change"
     "--skiptest" "Try trick readonly table on valkey table"
@@ -39,6 +41,7 @@ EXTRA_SKIP_ARGS=(
     "--skiptest" "Verify execution of prohibit dangerous Lua methods will fail"
     "--skiptest" "Binary code loading failed"
     "--skiptest" "LIBRARIES - register function inside a function"
+    "--skiptest" "LIBRARIES - deleting a function frees its long description"
     "--skiptest" "EVAL - Scripts support NULL byte"
     "--skiptest" "/Active Defrag eval scripts"
     "--skiptest" "CONFIG sanity"

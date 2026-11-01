@@ -70,11 +70,14 @@ void luauExtractErrorInformation(lua_State *lua, errorInfo *err_info);
 void luauErrorInformationDiscard(errorInfo *err_info);
 
 void luauReplyToServerReply(ValkeyModuleCtx *ctx, int resp_version, lua_State *lua);
-void callReplyToLuaType(lua_State *lua, ValkeyModuleCallReply *reply, int resp);
 
+int luauResume(luauCallCtx *call_ctx, lua_State *T, int nargs);
 void luauCallFunction(luauCallCtx *call_ctx, lua_State *T, int nargs);
 
 size_t luauMemoryForCategory(lua_State *lua, int category);
+
+ValkeyModuleDict *luauCoreCommandsCreate(ValkeyModuleCtx *ctx);
+void luauArgvCacheFree(luauEngineCtx *ectx);
 
 void luauWatchdogStart(void);
 void luauWatchdogStop(void);
