@@ -254,6 +254,12 @@ static void luauInstallLibraryLoadEnv(luauEngineCtx *engine_ctx, lua_State *L) {
     luauFreezeThreadEnv(engine_ctx, L, 1, 1);
 }
 
+static void luauKeepErrorObject(lua_State *T) {
+    if (lua_gettop(T) <= 1) return;
+    lua_replace(T, 1);
+    lua_settop(T, 1);
+}
+
 static void luauFinishLibraryEnv(luauEngineCtx *engine_ctx, lua_State *L) {
     lua_setreadonly(L, LUA_GLOBALSINDEX, 0);
     luauFreezeThreadEnv(engine_ctx, L, 0, 0);
@@ -314,9 +320,13 @@ luauFunctionLibraryCreate(luauEngineCtx *engine_ctx, ValkeyModuleCtx *module_ctx
     lua_setmemcat(env, LUAU_MEMCAT_FUNCTION);
 
     luauInterruptInstall(engine_ctx->GL, 1);
-    int status = lua_resume(env, NULL, 0);
+    int status = luauResume(&load_ctx, env, 0);
     luauInterruptInstall(engine_ctx->GL, 0);
     lua_setthreaddata(env, NULL);
+    if (status == LUA_OK || status == LUA_YIELD)
+        lua_settop(env, 0);
+    else
+        luauKeepErrorObject(env);
     luauFinishLibraryEnv(engine_ctx, env);
 
     if (status != LUA_OK) {

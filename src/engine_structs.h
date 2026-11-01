@@ -10,6 +10,9 @@
 #define LUAU_MEMCAT_EVAL 1
 #define LUAU_MEMCAT_FUNCTION 2
 
+#define LUAU_ARGV_CACHE_SIZE 32
+#define LUAU_ARGV_CACHE_MAX_LEN 64
+
 typedef struct luauEngineCtx {
     lua_State *GL;
 
@@ -35,6 +38,11 @@ typedef struct luauEngineCtx {
     long full_gc_count;
 
     uint32_t rand_state[3];
+
+    ValkeyModuleDict *core_commands;
+    ValkeyModuleString *argv_cache[LUAU_ARGV_CACHE_SIZE];
+    ValkeyModuleString *argv_buf[LUAU_ARGV_CACHE_SIZE];
+    int argv_cache_busy;
 } luauEngineCtx;
 
 typedef struct luauLibrary {

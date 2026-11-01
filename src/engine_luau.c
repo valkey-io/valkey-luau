@@ -77,12 +77,18 @@ static luauEngineCtx *createEngineContext(ValkeyModuleCtx *ctx) {
         ValkeyModule_Free(lctx);
         return NULL;
     }
+
+    lctx->core_commands = luauCoreCommandsCreate(ctx);
+    if (lctx->core_commands == NULL)
+        ValkeyModule_Log(ctx, "warning",
+                         "Could not list the built-in commands; server.call will not reuse arguments");
     return lctx;
 }
 
 static void destroyEngineContext(luauEngineCtx *lctx) {
     if (!lctx) return;
     luauDestroyVM(lctx);
+    luauArgvCacheFree(lctx);
     if (lctx->libraries) ValkeyModule_FreeDict(NULL, lctx->libraries);
     if (lctx->redis_version) ValkeyModule_Free(lctx->redis_version);
     if (lctx->server_name) ValkeyModule_Free(lctx->server_name);
@@ -455,6 +461,11 @@ VKM_PUBLIC int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **ar
         return VALKEYMODULE_ERR;
     }
 
+    ValkeyModule_Log(ctx, "notice", "%s",
+                     ValkeyModule_CallArgv
+                         ? "server.call uses ValkeyModule_CallArgv"
+                         : "server.call uses ValkeyModule_Call (ValkeyModule_CallArgv unavailable)");
+
     ValkeyModule_SetModuleOptions(ctx, VALKEYMODULE_OPTIONS_HANDLE_REPL_ASYNC_LOAD |
                                            VALKEYMODULE_OPTIONS_HANDLE_ATOMIC_SLOT_MIGRATION |
                                            VALKEYMODULE_OPTIONS_HANDLE_FORKLESS);
@@ -473,6 +484,7 @@ VKM_PUBLIC int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **ar
 
     if (ValkeyModule_LoadConfigs(ctx) == VALKEYMODULE_ERR) {
         ValkeyModule_Log(ctx, "warning", "Failed to load valkey-luau module configs");
+        luauWatchdogStop();
         destroyEngineContext(engine_ctx);
         engine_ctx = NULL;
         return VALKEYMODULE_ERR;
@@ -506,6 +518,7 @@ VKM_PUBLIC int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **ar
                              engine_names_cstr[i]);
             for (int j = 0; j < i; j++)
                 ValkeyModule_UnregisterScriptingEngine(ctx, engine_names_cstr[j]);
+            luauWatchdogStop();
             destroyEngineContext(engine_ctx);
             engine_ctx = NULL;
             return VALKEYMODULE_ERR;
