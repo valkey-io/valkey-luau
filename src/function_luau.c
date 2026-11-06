@@ -110,12 +110,14 @@ static int luauRegisterFunctionNamed(lua_State *lua, luauPendingReg *reg) {
         const char *key = lua_tostring(lua, -2);
 
         if (strcasecmp(key, "function_name") == 0) {
+            if (reg->name) ValkeyModule_FreeString(NULL, reg->name);
             if (!(reg->name = luauGetStringObject(lua, -1))) {
                 err = "function_name argument given to server.register_function "
                       "must be a string";
                 goto error;
             }
         } else if (strcasecmp(key, "description") == 0) {
+            if (reg->desc) ValkeyModule_FreeString(NULL, reg->desc);
             if (!(reg->desc = luauGetStringObject(lua, -1))) {
                 err = "description argument given to server.register_function "
                       "must be a string";
@@ -127,6 +129,7 @@ static int luauRegisterFunctionNamed(lua_State *lua, luauPendingReg *reg) {
                       "be a function";
                 goto error;
             }
+            if (reg->closure_ref) lua_unref(lua, reg->closure_ref);
             reg->closure_ref = lua_ref(lua, -1);
         } else if (strcasecmp(key, "flags") == 0) {
             if (!lua_istable(lua, -1)) {
@@ -316,13 +319,13 @@ luauFunctionLibraryCreate(luauEngineCtx *engine_ctx, ValkeyModuleCtx *module_ctx
         load_ctx.deadline_us = (uint64_t)ts.tv_sec * 1000000 +
                                (uint64_t)ts.tv_nsec / 1000 + timeout * 1000;
     }
-    lua_setthreaddata(env, &load_ctx);
+    luauSetCallCtx(env, &load_ctx);
     lua_setmemcat(env, LUAU_MEMCAT_FUNCTION);
 
     luauInterruptInstall(engine_ctx->GL, 1);
     int status = luauResume(&load_ctx, env, 0);
     luauInterruptInstall(engine_ctx->GL, 0);
-    lua_setthreaddata(env, NULL);
+    luauSetCallCtx(env, NULL);
     if (status == LUA_OK || status == LUA_YIELD)
         lua_settop(env, 0);
     else
