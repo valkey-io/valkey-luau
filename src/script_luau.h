@@ -73,6 +73,7 @@ void luauReplyToServerReply(ValkeyModuleCtx *ctx, int resp_version, lua_State *l
 
 int luauResume(luauCallCtx *call_ctx, lua_State *T, int nargs);
 void luauCallFunction(luauCallCtx *call_ctx, lua_State *T, int nargs);
+void luauSetCallCtx(lua_State *lua, luauCallCtx *ctx);
 
 size_t luauMemoryForCategory(lua_State *lua, int category);
 

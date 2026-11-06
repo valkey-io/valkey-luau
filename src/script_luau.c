@@ -111,9 +111,11 @@ static void *luauAlloc(void *ud, void *ptr, size_t osize, size_t nsize) {
 }
 
 static luauCallCtx *luauGetCallCtx(lua_State *lua) {
-    void *td = lua_getthreaddata(lua);
-    if (td) return td;
-    return NULL;
+    return lua_getthreaddata(lua_mainthread(lua));
+}
+
+void luauSetCallCtx(lua_State *lua, luauCallCtx *ctx) {
+    lua_setthreaddata(lua_mainthread(lua), ctx);
 }
 
 static uint64_t luauMonotonicUs(void) {
@@ -1927,7 +1929,7 @@ void luauCallFunction(luauCallCtx *call_ctx, lua_State *T, int nargs) {
     ValkeyModuleCtx *ctx = call_ctx->module_ctx;
     luauEngineCtx *engine_ctx = call_ctx->engine_ctx;
 
-    lua_setthreaddata(T, call_ctx);
+    luauSetCallCtx(T, call_ctx);
 
     long long busy_ms = atomic_load(&luau_busy_threshold_ms);
     int watched = 0;
@@ -1946,6 +1948,7 @@ void luauCallFunction(luauCallCtx *call_ctx, lua_State *T, int nargs) {
         atomic_compare_exchange_strong(&luau_wd_vm, &expected, NULL);
     }
     lua_callbacks(engine_ctx->GL)->interrupt = NULL;
+    luauSetCallCtx(T, NULL);
 
     if (++engine_ctx->gc_count >= LUAU_GC_CYCLE_PERIOD) {
         lua_gc(engine_ctx->GL, LUA_GCSTEP, LUAU_GC_CYCLE_PERIOD);

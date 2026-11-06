@@ -64,6 +64,20 @@ static void refreshBusyReplyThreshold(ValkeyModuleCtx *module_ctx) {
     ValkeyModule_FreeCallReply(reply);
 }
 
+static void luauConfigChangeEvent(ValkeyModuleCtx *ctx, ValkeyModuleEvent e,
+                                  uint64_t sub, void *data) {
+    VALKEYMODULE_NOT_USED(e);
+    if (sub != VALKEYMODULE_SUBEVENT_CONFIG_CHANGE) return;
+    ValkeyModuleConfigChange *cc = data;
+    for (uint32_t i = 0; i < cc->num_changes; i++) {
+        if (!strcmp(cc->config_names[i], "busy-reply-threshold") ||
+            !strcmp(cc->config_names[i], "lua-time-limit")) {
+            refreshBusyReplyThreshold(ctx);
+            return;
+        }
+    }
+}
+
 static luauEngineCtx *createEngineContext(ValkeyModuleCtx *ctx) {
     luauEngineCtx *lctx = ValkeyModule_Calloc(1, sizeof(*lctx));
     lctx->libraries = ValkeyModule_CreateDict(NULL);
@@ -481,6 +495,8 @@ VKM_PUBLIC int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **ar
     if (engine_ctx == NULL) return VALKEYMODULE_ERR;
 
     luauWatchdogStart();
+    ValkeyModule_SubscribeToServerEvent(ctx, ValkeyModuleEvent_Config,
+                                        luauConfigChangeEvent);
 
     if (ValkeyModule_LoadConfigs(ctx) == VALKEYMODULE_ERR) {
         ValkeyModule_Log(ctx, "warning", "Failed to load valkey-luau module configs");
