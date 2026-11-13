@@ -1483,19 +1483,18 @@ static int luauLogCommand(lua_State *lua) {
         return luauError(lua);
     }
 
-    char *log = lm_strcpy("");
+    ValkeyModuleString *log = ValkeyModule_CreateString(NULL, "", 0);
     for (int j = 1; j < argc; j++) {
-        size_t len = 0;
-        const char *s = lua_tolstring(lua, (-argc) + j, &len);
+        const char *s = lua_tostring(lua, (-argc) + j);
         if (!s) continue;
-        char *joined = lm_asprintf("%s%s%.*s", log, log[0] ? " " : "", (int)len, s);
-        ValkeyModule_Free(log);
-        log = joined;
+        if (j != 1) ValkeyModule_StringAppendBuffer(NULL, log, " ", 1);
+        ValkeyModule_StringAppendBuffer(NULL, log, s, strlen(s));
     }
 
     static const char *levels[] = {"debug", "verbose", "notice", "warning"};
-    ValkeyModule_Log(rctx ? rctx->module_ctx : NULL, levels[level], "%s", log);
-    ValkeyModule_Free(log);
+    ValkeyModule_Log(rctx ? rctx->module_ctx : NULL, levels[level], "%s",
+                     ValkeyModule_StringPtrLen(log, NULL));
+    ValkeyModule_FreeString(NULL, log);
     return 0;
 }
 
