@@ -28,6 +28,7 @@ echo ""
 EXTRA_SKIP_ARGS=(
     "--skiptest" "Forked scripting debug session does not suspend save points"
     "--skiptest" "server.log() keeps a multi-line message in one log record"
+    "--skiptest" "server.log() skips a first argument that is not a string"
     "--skiptest" "/Test scripting debug"
     "--skiptest" "/Dynamic reset of lua engine with insecure API config change"
     "--skiptest" "Try trick readonly table on valkey table"
