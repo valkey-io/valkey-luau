@@ -36,6 +36,7 @@ set(MODULE_SRCS
     src/engine_luau.c
     src/script_luau.c
     src/function_luau.c
+    src/luau_compat.cpp
     src/sha1.c
     src/rand.c
     src/lua_cjson.c
@@ -49,7 +50,8 @@ set(MODULE_SRCS
 add_library(valkeyluau SHARED ${MODULE_SRCS})
 
 target_compile_options(valkeyluau PRIVATE
-    -std=gnu11 -W -Wall -fno-common -fPIC -fvisibility=hidden -O2 -D_GNU_SOURCE)
+    $<$<COMPILE_LANGUAGE:C>:-std=gnu11>
+    -W -Wall -fno-common -fPIC -fvisibility=hidden -O2 -D_GNU_SOURCE)
 
 target_compile_definitions(valkeyluau PRIVATE LUA_VERSION_NUM=501)
 
@@ -59,7 +61,7 @@ target_include_directories(valkeyluau PRIVATE
     ${CMAKE_SOURCE_DIR}/deps/luau/Compiler/include
     ${CMAKE_SOURCE_DIR}/deps/luau/Common/include)
 
-target_link_libraries(valkeyluau PRIVATE Luau.VM Luau.Compiler Luau.Ast Luau.Bytecode)
+target_link_libraries(valkeyluau PRIVATE Luau.VM Luau.VM.Internals Luau.Compiler Luau.Ast Luau.Bytecode)
 
 if(IS_MACOS)
     set_target_properties(valkeyluau PROPERTIES
