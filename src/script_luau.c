@@ -22,6 +22,7 @@
 
 #include "engine_structs.h"
 #include "fpconv_dtoa.h"
+#include "luau_compat.h"
 
 int luaopen_cjson(lua_State *l);
 int luaopen_cjson_safe(lua_State *l);
@@ -1772,6 +1773,7 @@ lua_State *luauCreateVM(luauEngineCtx *ctx, ValkeyModuleCtx *module_ctx) {
 
     lua_pushcfunction(GL, luauRedisPcall, "pcall");
     lua_setfield(GL, LUA_GLOBALSINDEX, "pcall");
+    luauDisableBuiltinPcall(GL);
 
     lua_getfield(GL, LUA_GLOBALSINDEX, "error");
     lua_pushcclosure(GL, luauErrorFunction, "error", 1);
